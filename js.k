@@ -3,13 +3,12 @@ require "modules/substitution.k"
 module JS-SYNTAX
   syntax Ref ::= Int
 
-  syntax Func ::= "function" "(" Ids ")" "{" Stmt "}" [binder]
+  syntax Func ::= "function" "(" Ids ")" "{" Stmt "}"
 
   syntax Value ::= Ref
                  | String
                  | "undefined"
                  | "null"
-                 > Func
 
   syntax VarExpr ::= Id
                    | Id "=" Expr             [strict(2)]
@@ -20,6 +19,7 @@ module JS-SYNTAX
                 | Expr "[" Expr "]"          [seqstrict]
                 | Expr "[" Expr "]" "=" Expr [seqstrict]
                 | Id
+                | Func
                 | Expr "(" Values ")"        [seqstrict, left]
                 | "print" "(" Expr ")"       [strict]
                 > "(" Expr ")"               [bracket]
@@ -47,7 +47,21 @@ module JS
   imports JS-SYNTAX
   imports SUBSTITUTION
 
-  syntax ScopeObj ::= Scope(Value, Map)                 [strict(1)]
+  /**
+   * Scope objects have 3 fields:
+   *   1. Value: Ref to contextual scope object (provides scope chain)
+   *   2. Value: Ref to previous scope object (restored on function return)
+   *   3.   Map: Local environment
+   */
+  syntax ScopeObj ::= Scope(Value, Value, Map)
+
+  /**
+   * Function objects have 3 fields:
+   *   1.  Ref: Ref to contextual scope object (provides scope chain)
+   *   2.  Ids: Parameter list
+   *   3. Stmt: Body of the function
+   */
+  syntax FuncObj ::= Func(Ref, Ids, Stmt)
 
   syntax Lambda ::= "FBegin" Ids "**" Values "**" Stmt  [strict(2)]
 
@@ -67,9 +81,8 @@ module JS
 
   syntax RetValue ::= Ref
                     | String
-                    > Func
 
-  syntax K ::= ObjMap | SetterReturn | "FEnd"
+  syntax K ::= ObjMap | FuncObj | SetterReturn | "FEnd"
   syntax KResult ::= Value | ValObjField | RetValue | "return" RetValue
 
   configuration <C>
@@ -77,7 +90,7 @@ module JS
                     <Stage> .Map </Stage>
                     <E> 0 </E>
                     <Store> .Map </Store>
-                    <ObjStore> Map( 0 |-> Scope(null, .Map) ) </ObjStore>
+                    <ObjStore> Map( 0 |-> Scope(null, null, .Map) ) </ObjStore>
                     <R> 1 </R>
                     <in stream="stdin"> .List </in>
                     <out stream="stdout"> .List </out>
@@ -154,19 +167,29 @@ module JS
        <k> (V:Value ~> SetRet(V2:Value) => V2) ... </k>
 
   /**
+   * Function Definitions
+   */
+
+  rule [Function-Define]:
+       <k> ( function (Xs:Ids) { Body:Stmt } => R ) ... </k>
+       <ObjStore> OS:Map (. => R |-> Func(Env, Xs, Body)) </ObjStore>
+       <R> R:Ref => R +Int 1 </R>
+       <E> Env:Ref </E>
+
+  /**
    * Function Application
    */
 
   rule [E-ApplyBegin] :
-       <k> ( (function (Xs:Ids) { Body:Stmt })(Vs:Values) => FBegin Xs ** Vs ** Body ~> FEnd ) ... </k>
-       <ObjStore> OS:Map (. => R |-> Scope(Env, .Map)) </ObjStore>
+       <k> ( F:Ref(Vs:Values) => FBegin Xs ** Vs ** Body ~> FEnd ) ... </k>
+       <ObjStore> OS:Map (F |-> Func(ParentEnv:Ref, Xs:Ids, Body:Stmt)) (. => R |-> Scope(ParentEnv, PrevEnv, .Map)) </ObjStore>
        <R> R:Ref => R +Int 1 </R>
-       <E> Env:Ref => R </E>
+       <E> PrevEnv:Ref => R </E>
 
   rule [E-ApplyBindParameters] :
        <k> ( FBegin X:Id, Xs:Ids ** V:Value, Vs:Values ** Body => FBegin Xs ** Vs ** Body ) ... </k>
        <Store> S:Map (. => R |-> V) </Store>
-       <ObjStore> OS:Map ( Env |-> Scope(_, M:Map => M[R / X]) ) </ObjStore>
+       <ObjStore> OS:Map ( Env |-> Scope(_, _, M:Map => M[R / X]) ) </ObjStore>
        <R> R:Ref => R +Int 1 </R>
        <E> Env:Ref </E>
 
@@ -174,13 +197,13 @@ module JS
 
   rule [E-ApplyEnd] :
        <k> ( V:Value ~> FEnd => undefined ) ... </k>
-       <ObjStore> OS:Map ( Env |-> Scope(ContextEnv:Ref, _) ) </ObjStore>
-       <E> Env:Ref => ContextEnv </E>
+       <ObjStore> OS:Map ( Env |-> Scope(_, PrevEnv:Ref, _) ) </ObjStore>
+       <E> Env:Ref => PrevEnv </E>
 
   rule [E-ApplyReturn] :
        <k> ( return V:RetValue ~> FEnd => V ) ... </k>
-       <ObjStore> OS:Map ( Env |-> Scope(ContextEnv:Ref, _) ) </ObjStore>
-       <E> Env:Ref => ContextEnv </E>
+       <ObjStore> OS:Map ( Env |-> Scope(_, PrevEnv:Ref, _) ) </ObjStore>
+       <E> Env:Ref => PrevEnv </E>
 
   rule return V:RetValue ; S:Stmt => return V
 
@@ -199,14 +222,14 @@ module JS
   rule [Declare]:
        <k> var (X:Id, Xs:VarExprs => Xs) ... </k>
        <Store> S:Map (. => R |-> undefined) </Store>
-       <ObjStore> OS:Map ( Env |-> Scope(_, M:Map => M[R / X]) ) </ObjStore>
+       <ObjStore> OS:Map ( Env |-> Scope(_, _, M:Map => M[R / X]) ) </ObjStore>
        <R> R:Ref => R +Int 1 </R>
        <E> Env:Ref </E>
 
   rule [E-Assign]:
        <k> var (X:Id = V:Value, Xs:VarExprs => Xs) ... </k>
        <Store> S:Map (. => R |-> V) </Store>
-       <ObjStore> OS:Map ( Env |-> Scope(_, M:Map => M[R / X]) ) </ObjStore>
+       <ObjStore> OS:Map ( Env |-> Scope(_, _, M:Map => M[R / X]) ) </ObjStore>
        <R> R:Ref => R +Int 1 </R>
        <E> Env:Ref </E>
 
@@ -215,7 +238,7 @@ module JS
   rule [E-Loc]:
        <k> ( X:Id => V ) ... </k>
        <Store> S:Map (R |-> V:Value) </Store>
-       <ObjStore> OS:Map ( Env |-> Scope(_, M:Map(X |-> R:Ref)) ) </ObjStore>
+       <ObjStore> OS:Map ( Env |-> Scope(_, _, M:Map(X |-> R:Ref)) ) </ObjStore>
        <E> Env:Ref </E>
 
 endmodule
